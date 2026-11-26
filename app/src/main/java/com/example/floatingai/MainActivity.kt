@@ -1,6 +1,8 @@
 package com.example.floatingai
 
+import android.app.Activity
 import android.content.Intent
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,40 +12,63 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
+
+    private lateinit var statusView: TextView
+    private lateinit var apiInput: EditText
+
+    private val projectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            val intent = Intent(this, FloatingOverlayService::class.java).apply {
+                action = FloatingOverlayService.ACTION_START_WITH_PROJECTION
+                putExtra(FloatingOverlayService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(FloatingOverlayService.EXTRA_DATA_INTENT, result.data)
+            }
+            startOverlayServiceCompat(intent)
+            statusView.text = "Status: Overlay & izin tangkap layar aktif."
+        } else {
+            statusView.text = "Status: Izin tangkap layar (MediaProjection) ditolak."
+            Toast.makeText(this, "Izin tangkap layar diperlukan untuk scan soal", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val statusView = TextView(this).apply {
-            text = "Status: Menunggu aktivasi"
+        statusView = TextView(this).apply {
+            text = "Status: Siap dikonfigurasi"
             setPadding(0, 0, 0, 24)
         }
 
-        val apiInput = EditText(this).apply {
+        apiInput = EditText(this).apply {
             hint = "Masukkan Gemini API Key"
             val prefs = getSharedPreferences("ai_prefs", MODE_PRIVATE)
             setText(prefs.getString("gemini_api_key", ""))
         }
 
         val permBtn = Button(this).apply {
-            text = "Buka Izin Tampil di Atas Aplikasi Lain"
+            text = "1. Izinkan Tampil di Atas Aplikasi Lain"
             setOnClickListener {
-                val intent = Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:$packageName")
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
                 )
-                startActivity(intent)
             }
         }
 
         val startBtn = Button(this).apply {
-            text = "Aktifkan Floating Mod Menu"
+            text = "2. Aktifkan Floating Mod Menu"
             setOnClickListener {
                 val key = apiInput.text.toString().trim()
                 if (key.isEmpty()) {
-                    Toast.makeText(this@MainActivity, "API Key wajib diisi", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Gemini API Key wajib diisi", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
                 getSharedPreferences("ai_prefs", MODE_PRIVATE)
@@ -52,28 +77,29 @@ class MainActivity : AppCompatActivity() {
                     .apply()
 
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    statusView.text = "Status: Izin overlay belum aktif. Aktifkan dulu di pengaturan."
-                    val intent = Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
+                    statusView.text = "Status: Aktifkan dulu izin Tampil di atas aplikasi lain."
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
                     )
-                    startActivity(intent)
                     return@setOnClickListener
                 }
 
-                try {
-                    val serviceIntent = Intent(this@MainActivity, FloatingOverlayService::class.java)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(serviceIntent)
-                    } else {
-                        startService(serviceIntent)
-                    }
-                    statusView.text = "Status: Service overlay dijalankan. Cek layar atas kiri."
-                    Toast.makeText(this@MainActivity, "Floating overlay dijalankan", Toast.LENGTH_SHORT).show()
-                } catch (e: Exception) {
-                    statusView.text = "Gagal jalankan overlay: ${e.message}"
-                    Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+                val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                projectionLauncher.launch(mpm.createScreenCaptureIntent())
+            }
+        }
+
+        val revokeBtn = Button(this).apply {
+            text = "Revoke (Hentikan & Hapus Semua Overlay)"
+            setOnClickListener {
+                val intent = Intent(this@MainActivity, FloatingOverlayService::class.java).apply {
+                    action = FloatingOverlayService.ACTION_REVOKE
                 }
+                startService(intent)
+                statusView.text = "Status: Semua overlay & sesi di-revoke."
             }
         }
 
@@ -84,17 +110,16 @@ class MainActivity : AppCompatActivity() {
             addView(apiInput)
             addView(permBtn)
             addView(startBtn)
+            addView(revokeBtn)
         }
         setContentView(layout)
     }
 
-    override fun onResume() {
-        super.onResume()
-        val canDraw = Settings.canDrawOverlays(this)
-        Toast.makeText(
-            this,
-            if (canDraw) "Izin overlay: AKTIF" else "Izin overlay: BELUM AKTIF",
-            Toast.LENGTH_SHORT
-        ).show()
+    private fun startOverlayServiceCompat(intent: Intent) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 }
