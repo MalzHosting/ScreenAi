@@ -1,5 +1,6 @@
 package com.example.floatingai
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
@@ -30,16 +31,15 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -60,7 +60,7 @@ class FloatingOverlayService : Service() {
         const val EXTRA_DATA_INTENT = "extra_data_intent"
     }
 
-    private val serviceJob = Job()
+    private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Main + serviceJob)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val httpClient = OkHttpClient.Builder()
@@ -69,53 +69,55 @@ class FloatingOverlayService : Service() {
         .build()
 
     private var windowManager: WindowManager? = null
-    private var panelView: LinearLayout? = null
+    private var panelContainer: LinearLayout? = null
+    private var panelWebView: WebView? = null
     private var panelParams: WindowManager.LayoutParams? = null
     private var bubbleView: TextView? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var cropOverlayView: CropBoxView? = null
-    private var cropParams: WindowManager.LayoutParams? = null
 
-    private var resultView: TextView? = null
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    @Volatile private var latestBitmap: Bitmap? = null
 
     private var screenWidth = 1080
     private var screenHeight = 1920
     private var screenDensity = 3
-
     private var selectedRect = Rect(80, 320, 1000, 1100)
-    private var isSelectingArea = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_REVOKE -> {
-                revokeAll()
-                return START_NOT_STICKY
-            }
-            ACTION_START_WITH_PROJECTION -> {
-                startForegroundCompat()
-                initScreenMetrics()
-                val code = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-                @Suppress("DEPRECATION")
-                val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(EXTRA_DATA_INTENT, Intent::class.java)
-                } else {
-                    intent.getParcelableExtra(EXTRA_DATA_INTENT)
+        try {
+            when (intent?.action) {
+                ACTION_REVOKE -> {
+                    revokeAll()
+                    return START_NOT_STICKY
                 }
-                if (code == Activity.RESULT_OK && data != null) {
-                    setupMediaProjection(code, data)
+                ACTION_START_WITH_PROJECTION -> {
+                    startForegroundCompat(includeMediaProjection = true)
+                    initScreenMetrics()
+                    val code = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                    @Suppress("DEPRECATION")
+                    val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(EXTRA_DATA_INTENT, Intent::class.java)
+                    } else {
+                        intent.getParcelableExtra(EXTRA_DATA_INTENT)
+                    }
+                    if (code == Activity.RESULT_OK && data != null) {
+                        setupMediaProjectionSafely(code, data)
+                    }
+                    showPanel()
                 }
-                showPanel()
+                else -> {
+                    startForegroundCompat(includeMediaProjection = false)
+                    initScreenMetrics()
+                    showPanel()
+                }
             }
-            else -> {
-                startForegroundCompat()
-                initScreenMetrics()
-                showPanel()
-            }
+        } catch (e: Exception) {
+            pushAnswerToPanel("Error start service: ${e.message}")
         }
         return START_STICKY
     }
@@ -129,153 +131,130 @@ class FloatingOverlayService : Service() {
         screenHeight = metrics.heightPixels.coerceAtLeast(800)
         screenDensity = metrics.densityDpi.coerceAtLeast(160)
 
-        val left = (screenWidth * 0.08f).toInt()
-        val right = (screenWidth * 0.92f).toInt()
-        val top = (screenHeight * 0.22f).toInt()
-        val bottom = (screenHeight * 0.56f).toInt()
-        selectedRect = Rect(left, top, right, bottom)
+        selectedRect = Rect(
+            (screenWidth * 0.08f).toInt(),
+            (screenHeight * 0.22f).toInt(),
+            (screenWidth * 0.92f).toInt(),
+            (screenHeight * 0.56f).toInt()
+        )
     }
 
-    private fun startForegroundCompat() {
+    private fun startForegroundCompat(includeMediaProjection: Boolean) {
         val channelId = "screen_ai_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 channelId,
-                "ScreenAi Service",
-                NotificationManager.IMPORTANCE_DEFAULT
+                "ScreenAi Overlay",
+                NotificationManager.IMPORTANCE_LOW
             )
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         val notif: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("ScreenAi Berjalan")
-            .setContentText("Siap scan area soal & gambar ke Gemini AI")
+            .setContentTitle("ScreenAi Aktif")
+            .setContentText("Overlay & pembaca soal berjalan")
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .setOngoing(true)
             .build()
 
         val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            if (includeMediaProjection) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            }
         } else {
             0
         }
         ServiceCompat.startForeground(this, 101, notif, fgsType)
     }
 
-    private fun setupMediaProjection(resultCode: Int, data: Intent) {
-        stopProjectionOnly()
-        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = mpm.getMediaProjection(resultCode, data)
-        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                super.onStop()
-                cleanupProjectionResources()
-            }
-        }, mainHandler)
+    private fun setupMediaProjectionSafely(resultCode: Int, data: Intent) {
+        cleanupProjectionResources()
+        try {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val mp = mpm.getMediaProjection(resultCode, data) ?: return
+            mediaProjection = mp
 
-        imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "ScreenAiCapture",
-            screenWidth,
-            screenHeight,
-            screenDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface,
-            null,
-            mainHandler
-        )
+            mp.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    super.onStop()
+                    cleanupProjectionResources()
+                }
+            }, mainHandler)
+
+            val reader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
+            reader.setOnImageAvailableListener({ ir ->
+                val img = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    val plane = img.planes[0]
+                    val buffer = plane.buffer
+                    val pixelStride = plane.pixelStride
+                    val rowStride = plane.rowStride
+                    val rowPadding = rowStride - pixelStride * screenWidth
+
+                    val rawBmp = Bitmap.createBitmap(
+                        screenWidth + rowPadding / pixelStride,
+                        screenHeight,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    rawBmp.copyPixelsFromBuffer(buffer)
+                    val cleanBmp = Bitmap.createBitmap(rawBmp, 0, 0, screenWidth, screenHeight)
+                    if (cleanBmp != rawBmp) rawBmp.recycle()
+
+                    val old = latestBitmap
+                    latestBitmap = cleanBmp
+                    old?.recycle()
+                } catch (_: Exception) {
+                } finally {
+                    img.close()
+                }
+            }, mainHandler)
+
+            imageReader = reader
+            virtualDisplay = mp.createVirtualDisplay(
+                "ScreenAiVD",
+                screenWidth,
+                screenHeight,
+                screenDensity,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface,
+                null,
+                mainHandler
+            )
+        } catch (e: Exception) {
+            pushAnswerToPanel("Gagal setup screen capture: ${e.message}")
+        }
     }
 
+    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
     private fun showPanel() {
         removeBubbleView()
         removeCropOverlay()
-        if (panelView != null) {
-            panelView?.visibility = View.VISIBLE
+
+        if (panelContainer != null) {
+            panelContainer?.visibility = View.VISIBLE
             return
         }
 
         val params = WindowManager.LayoutParams(
-            (screenWidth * 0.86f).toInt(),
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            (screenWidth * 0.88f).toInt(),
+            (screenHeight * 0.46f).toInt(),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 40
+            x = 32
             y = 140
         }
         panelParams = params
 
-        val header = TextView(this).apply {
-            text = "≡ ScreenAi Mod Menu (Geser di sini)"
+        val dragBar = TextView(this).apply {
+            text = "  ≡  ScreenAi  •  Geser Panel"
             setTextColor(Color.parseColor("#38BDF8"))
-            setPadding(12, 8, 12, 12)
-        }
-
-        val areaBtn = Button(this).apply {
-            text = "Atur Ukuran / Area Baca"
-            setOnClickListener {
-                toggleCropBox()
-            }
-        }
-
-        val scanBtn = Button(this).apply {
-            text = "Scan Area & Jawab (Gemini)"
-            setOnClickListener {
-                runScanAndAskGemini()
-            }
-        }
-
-        val minBtn = Button(this).apply {
-            text = "Tutup ke Icon Mengambang"
-            setOnClickListener {
-                minimizeToBubble()
-            }
-        }
-
-        val revokeBtn = Button(this).apply {
-            text = "Revoke (Hapus Semua)"
-            setTextColor(Color.parseColor("#F87171"))
-            setOnClickListener {
-                revokeAll()
-            }
-        }
-
-        val answerText = TextView(this).apply {
-            text = "1. Tekan 'Atur Ukuran / Area Baca' untuk memilih bagian teks/gambar soal.\n2. Tekan 'Scan Area & Jawab (Gemini)'."
-            setTextColor(Color.WHITE)
-            setPadding(12, 12, 12, 12)
-        }
-        resultView = answerText
-
-        val scrollResult = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (screenHeight * 0.24f).toInt()
-            )
-            addView(answerText)
-        }
-
-        val btnRow1 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(areaBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(scanBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        }
-
-        val btnRow2 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(minBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(revokeBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        }
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#EB0F172A"))
-            setPadding(20, 20, 20, 20)
-            addView(header)
-            addView(btnRow1)
-            addView(btnRow2)
-            addView(scrollResult)
+            textSize = 12f
+            setBackgroundColor(Color.parseColor("#FF0F172A"))
+            setPadding(16, 18, 16, 18)
         }
 
         var initialX = 0
@@ -283,7 +262,7 @@ class FloatingOverlayService : Service() {
         var touchX = 0f
         var touchY = 0f
 
-        header.setOnTouchListener { _, event ->
+        dragBar.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     initialX = params.x
@@ -296,7 +275,7 @@ class FloatingOverlayService : Service() {
                     params.x = initialX + (event.rawX - touchX).toInt()
                     params.y = initialY + (event.rawY - touchY).toInt()
                     try {
-                        windowManager?.updateViewLayout(container, params)
+                        windowManager?.updateViewLayout(panelContainer, params)
                     } catch (_: Exception) {
                     }
                     true
@@ -305,14 +284,89 @@ class FloatingOverlayService : Service() {
             }
         }
 
+        val wv = WebView(this).apply {
+            setBackgroundColor(Color.parseColor("#F20A101D"))
+            settings.javaScriptEnabled = true
+            addJavascriptInterface(OverlayBridge(), "OverlayApi")
+            loadDataWithBaseURL(null, buildPanelHtml(), "text/html", "UTF-8", null)
+        }
+        panelWebView = wv
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#F20A101D"))
+            addView(dragBar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(wv, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT))
+        }
+
         try {
             windowManager?.addView(container, params)
-            panelView = container
+            panelContainer = container
         } catch (e: Exception) {
-            Toast.makeText(this, "Gagal membuka panel: ${e.message}", Toast.LENGTH_LONG).show()
+            pushAnswerToPanel("Gagal menampilkan overlay: ${e.message}")
         }
     }
 
+    private fun buildPanelHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html lang="id">
+            <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+              * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+              body {
+                margin: 0; padding: 10px; background: transparent; color: #F8FAFC;
+                display: flex; flex-direction: column; height: 100vh;
+              }
+              .grid-btn { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-bottom: 8px; }
+              button {
+                border: none; border-radius: 10px; padding: 9px 8px;
+                font-size: 11px; font-weight: 700; cursor: pointer;
+              }
+              .b-area { background: rgba(56,189,248,0.18); color: #38BDF8; border: 1px solid rgba(56,189,248,0.35); }
+              .b-scan { background: linear-gradient(135deg, #0284C7, #38BDF8); color: #04101A; }
+              .b-min  { background: rgba(148,163,184,0.16); color: #E2E8F0; border: 1px solid rgba(148,163,184,0.25); }
+              .b-rev  { background: rgba(239,68,68,0.2); color: #F87171; border: 1px solid rgba(248,113,113,0.4); }
+              .answer-box {
+                flex: 1; overflow-y: auto; background: rgba(2, 6, 23, 0.85);
+                border: 1px solid rgba(148,163,184,0.16); border-radius: 12px;
+                padding: 10px; font-size: 12px; line-height: 1.5; color: #E2E8F0;
+                white-space: pre-wrap;
+              }
+            </style>
+            </head>
+            <body>
+              <div class="grid-btn">
+                <button class="b-area" onclick="OverlayApi.toggleArea()">Atur Area</button>
+                <button class="b-scan" onclick="OverlayApi.scanNow()">Scan Soal</button>
+                <button class="b-min" onclick="OverlayApi.minimizeBubble()">Tutup ke Icon</button>
+                <button class="b-rev" onclick="OverlayApi.revokeNow()">Revoke Semua</button>
+              </div>
+              <div id="out" class="answer-box">Atur area soal/gambar lalu tekan Scan Soal.</div>
+              <script>
+                function setAnswer(text) {
+                  const box = document.getElementById('out');
+                  box.innerText = text;
+                  box.scrollTop = 0;
+                }
+              </script>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    private fun pushAnswerToPanel(msg: String) {
+        val safe = msg.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
+        mainHandler.post {
+            try {
+                panelWebView?.evaluateJavascript("setAnswer('$safe');", null)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
     private fun minimizeToBubble() {
         removeCropOverlay()
         removePanelView()
@@ -326,17 +380,17 @@ class FloatingOverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 30
-            y = 320
+            x = 28
+            y = 280
         }
         bubbleParams = params
 
         val bubble = TextView(this).apply {
             text = "AI"
             setTextColor(Color.WHITE)
-            textSize = 16f
+            textSize = 15f
             setBackgroundColor(Color.parseColor("#E60284C7"))
-            setPadding(34, 26, 34, 26)
+            setPadding(32, 24, 32, 24)
         }
 
         var initialX = 0
@@ -358,9 +412,7 @@ class FloatingOverlayService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - touchX).toInt()
                     val dy = (event.rawY - touchY).toInt()
-                    if (kotlin.math.abs(dx) > 10 || kotlin.math.abs(dy) > 10) {
-                        moved = true
-                    }
+                    if (kotlin.math.abs(dx) > 10 || kotlin.math.abs(dy) > 10) moved = true
                     params.x = initialX + dx
                     params.y = initialY + dy
                     try {
@@ -370,9 +422,7 @@ class FloatingOverlayService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!moved) {
-                        showPanel()
-                    }
+                    if (!moved) showPanel()
                     true
                 }
                 else -> false
@@ -382,20 +432,17 @@ class FloatingOverlayService : Service() {
         try {
             windowManager?.addView(bubble, params)
             bubbleView = bubble
-        } catch (e: Exception) {
-            Toast.makeText(this, "Gagal membuat bubble: ${e.message}", Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
         }
     }
 
-    private fun toggleCropBox() {
+    private fun toggleCropOverlay() {
         if (cropOverlayView != null) {
             removeCropOverlay()
-            isSelectingArea = false
-            resultView?.text = "Area tersimpan: ${selectedRect.width()}x${selectedRect.height()} px. Tekan 'Scan Area & Jawab (Gemini)'."
+            pushAnswerToPanel("Area dikunci: ${selectedRect.width()}x${selectedRect.height()} px. Tekan Scan Soal.")
             return
         }
 
-        isSelectingArea = true
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -403,147 +450,106 @@ class FloatingOverlayService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
-        cropParams = params
 
-        val cropView = CropBoxView(this, selectedRect) { updatedRect ->
-            selectedRect.set(updatedRect)
+        val view = CropBoxView(this, selectedRect) { rect ->
+            selectedRect.set(rect)
         }
-
         try {
-            windowManager?.addView(cropView, params)
-            cropOverlayView = cropView
-            resultView?.text = "Seret kotak atau sudut kanan bawah untuk mengatur ukuran area soal/gambar, lalu tekan 'Atur Ukuran / Area Baca' lagi untuk mengunci."
+            windowManager?.addView(view, params)
+            cropOverlayView = view
+            pushAnswerToPanel("Geser kotak atau sudut kanan bawah untuk pilih ukuran area, lalu tekan Atur Area lagi.")
         } catch (e: Exception) {
-            Toast.makeText(this, "Gagal menampilkan kotak area: ${e.message}", Toast.LENGTH_SHORT).show()
+            pushAnswerToPanel("Gagal buka area crop: ${e.message}")
         }
     }
 
-    private fun runScanAndAskGemini() {
+    private fun triggerScan() {
         val apiKey = getSharedPreferences("ai_prefs", MODE_PRIVATE)
             .getString("gemini_api_key", "")
             ?.trim()
             .orEmpty()
 
         if (apiKey.isEmpty()) {
-            resultView?.text = "Error: Gemini API Key kosong. Buka aplikasi utama dan isi API Key."
-            return
-        }
-
-        if (mediaProjection == null || imageReader == null) {
-            resultView?.text = "Error: MediaProjection belum aktif. Buka aplikasi utama dan tekan '2. Aktifkan Floating Mod Menu'."
+            pushAnswerToPanel("API Key kosong. Buka aplikasi utama dan isi Gemini API Key.")
             return
         }
 
         removeCropOverlay()
-        val prevVisibility = panelView?.visibility ?: View.VISIBLE
-        panelView?.visibility = View.INVISIBLE
-        resultView?.text = "Sedang mengambil & menganalisis area layar..."
+        val prevVis = panelContainer?.visibility ?: View.VISIBLE
+        panelContainer?.visibility = View.INVISIBLE
+        pushAnswerToPanel("Memindai area layar...")
 
         mainHandler.postDelayed({
             serviceScope.launch {
                 try {
-                    val croppedBitmap = captureCroppedBitmap(selectedRect)
-                    panelView?.visibility = prevVisibility
+                    val src = latestBitmap
+                    val cropped = if (src != null && !src.isRecycled) {
+                        val safeL = selectedRect.left.coerceIn(0, src.width - 2)
+                        val safeT = selectedRect.top.coerceIn(0, src.height - 2)
+                        val safeW = selectedRect.width().coerceAtLeast(32).coerceAtMost(src.width - safeL)
+                        val safeH = selectedRect.height().coerceAtLeast(32).coerceAtMost(src.height - safeT)
+                        Bitmap.createBitmap(src, safeL, safeT, safeW, safeH)
+                    } else null
 
-                    if (croppedBitmap == null) {
-                        resultView?.text = "Gagal mengambil gambar layar. Pastikan layar tidak diblokir proteksi aplikasi."
+                    panelContainer?.visibility = prevVis
+
+                    if (cropped == null) {
+                        pushAnswerToPanel("Frame layar belum tersedia. Pastikan izin rekam layar aktif dan layar tidak diblokir proteksi aplikasi.")
                         return@launch
                     }
 
-                    val answer = withContext(Dispatchers.IO) {
-                        queryGeminiWithImage(apiKey, croppedBitmap)
+                    val reply = withContext(Dispatchers.IO) {
+                        askGemini(apiKey, cropped)
                     }
-                    resultView?.text = answer
+                    cropped.recycle()
+                    pushAnswerToPanel(reply)
                 } catch (e: Exception) {
-                    panelView?.visibility = prevVisibility
-                    resultView?.text = "Terjadi error: ${e.message}"
+                    panelContainer?.visibility = prevVis
+                    pushAnswerToPanel("Gagal memproses soal: ${e.message}")
                 }
             }
         }, 250)
     }
 
-    private fun captureCroppedBitmap(rect: Rect): Bitmap? {
-        val reader = imageReader ?: return null
-        val image = reader.acquireLatestImage() ?: return null
-        return try {
-            val plane = image.planes[0]
-            val buffer = plane.buffer
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
-            val rowPadding = rowStride - pixelStride * screenWidth
+    private fun askGemini(apiKey: String, bitmap: Bitmap): String {
+        val baos = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+        val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
-            val fullBitmap = Bitmap.createBitmap(
-                screenWidth + rowPadding / pixelStride,
-                screenHeight,
-                Bitmap.Config.ARGB_8888
-            )
-            fullBitmap.copyPixelsFromBuffer(buffer)
-
-            val trimmedFull = Bitmap.createBitmap(fullBitmap, 0, 0, screenWidth, screenHeight)
-            if (trimmedFull != fullBitmap) fullBitmap.recycle()
-
-            val safeLeft = rect.left.coerceIn(0, screenWidth - 2)
-            val safeTop = rect.top.coerceIn(0, screenHeight - 2)
-            val safeWidth = rect.width().coerceAtLeast(32).coerceAtMost(screenWidth - safeLeft)
-            val safeHeight = rect.height().coerceAtLeast(32).coerceAtMost(screenHeight - safeTop)
-
-            val cropped = Bitmap.createBitmap(trimmedFull, safeLeft, safeTop, safeWidth, safeHeight)
-            if (cropped != trimmedFull) trimmedFull.recycle()
-            cropped
-        } finally {
-            image.close()
-        }
-    }
-
-    private fun queryGeminiWithImage(apiKey: String, bitmap: Bitmap): String {
-        val out = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
-        val base64Image = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
-
-        val partImage = JSONObject().apply {
-            put("inline_data", JSONObject().apply {
-                put("mime_type", "image/jpeg")
-                put("data", base64Image)
+        val parts = JSONArray().apply {
+            put(JSONObject().apply {
+                put("inline_data", JSONObject().apply {
+                    put("mime_type", "image/jpeg")
+                    put("data", b64)
+                })
             })
-        }
-        val partText = JSONObject().apply {
-            put(
-                "text",
-                "Baca semua teks, rumus, tabel, atau gambar soal pada bagian layar ini. Berikan jawaban yang jelas dan akurat dalam Bahasa Indonesia, disertai langkah singkat bila perlu."
-            )
+            put(JSONObject().apply {
+                put("text", "Baca teks, rumus, tabel, atau gambar soal pada bagian layar ini. Berikan jawaban yang jelas, tepat, dan ringkas dalam Bahasa Indonesia.")
+            })
         }
         val payload = JSONObject().apply {
             put("contents", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("parts", JSONArray().apply {
-                        put(partImage)
-                        put(partText)
-                    })
-                })
+                put(JSONObject().put("parts", parts))
             })
         }
 
         val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
-        val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder().url(url).post(body).build()
+        val req = Request.Builder()
+            .url(url)
+            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
 
-        httpClient.newCall(request).execute().use { resp ->
-            val rawBody = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                return "HTTP ${resp.code}: $rawBody"
-            }
-            val root = JSONObject(rawBody)
-            val candidates = root.optJSONArray("candidates") ?: return "Tidak ada kandidat jawaban."
-            if (candidates.length() == 0) return "Respons kosong dari Gemini."
-            val parts = candidates.getJSONObject(0)
-                .optJSONObject("content")
-                ?.optJSONArray("parts") ?: return "Format jawaban tidak ditemukan."
+        httpClient.newCall(req).execute().use { res ->
+            val bodyStr = res.body?.string().orEmpty()
+            if (!res.isSuccessful) return "Error API (${res.code}): $bodyStr"
+            val json = JSONObject(bodyStr)
+            val cand = json.optJSONArray("candidates") ?: return "Respons kosong."
+            if (cand.length() == 0) return "Tidak ada jawaban dihasilkan."
+            val resParts = cand.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts") ?: return "Format tidak valid."
             val sb = StringBuilder()
-            for (i in 0 until parts.length()) {
-                val txt = parts.getJSONObject(i).optString("text", "")
-                if (txt.isNotEmpty()) {
-                    sb.append(txt)
-                }
+            for (i in 0 until resParts.length()) {
+                val t = resParts.getJSONObject(i).optString("text", "")
+                if (t.isNotEmpty()) sb.append(t)
             }
             return if (sb.isNotEmpty()) sb.toString().trim() else "Jawaban kosong."
         }
@@ -553,7 +559,12 @@ class FloatingOverlayService : Service() {
         removeCropOverlay()
         removePanelView()
         removeBubbleView()
-        stopProjectionOnly()
+        cleanupProjectionResources()
+        try {
+            mediaProjection?.stop()
+        } catch (_: Exception) {
+        }
+        mediaProjection = null
         serviceJob.cancel()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -562,15 +573,6 @@ class FloatingOverlayService : Service() {
             stopForeground(true)
         }
         stopSelf()
-    }
-
-    private fun stopProjectionOnly() {
-        cleanupProjectionResources()
-        try {
-            mediaProjection?.stop()
-        } catch (_: Exception) {
-        }
-        mediaProjection = null
     }
 
     private fun cleanupProjectionResources() {
@@ -585,16 +587,28 @@ class FloatingOverlayService : Service() {
         } catch (_: Exception) {
         }
         imageReader = null
+
+        try {
+            latestBitmap?.recycle()
+        } catch (_: Exception) {
+        }
+        latestBitmap = null
     }
 
     private fun removePanelView() {
-        panelView?.let {
+        try {
+            panelWebView?.destroy()
+        } catch (_: Exception) {
+        }
+        panelWebView = null
+
+        panelContainer?.let {
             try {
                 windowManager?.removeView(it)
             } catch (_: Exception) {
             }
         }
-        panelView = null
+        panelContainer = null
     }
 
     private fun removeBubbleView() {
@@ -630,12 +644,33 @@ class FloatingOverlayService : Service() {
         super.onDestroy()
     }
 
+    private inner class OverlayBridge {
+        @JavascriptInterface
+        fun toggleArea() {
+            mainHandler.post { toggleCropOverlay() }
+        }
+
+        @JavascriptInterface
+        fun scanNow() {
+            mainHandler.post { triggerScan() }
+        }
+
+        @JavascriptInterface
+        fun minimizeBubble() {
+            mainHandler.post { minimizeToBubble() }
+        }
+
+        @JavascriptInterface
+        fun revokeNow() {
+            mainHandler.post { revokeAll() }
+        }
+    }
+
     private class CropBoxView(
         context: Context,
         initialRect: Rect,
         private val onRectChanged: (Rect) -> Unit
     ) : View(context) {
-
         private val boxRect = Rect(initialRect)
         private val borderPaint = Paint().apply {
             color = Color.parseColor("#38BDF8")
@@ -651,69 +686,62 @@ class FloatingOverlayService : Service() {
             color = Color.parseColor("#66000000")
             style = Paint.Style.FILL
         }
-
-        private enum class DragMode { NONE, MOVE, RESIZE_BR }
-        private var dragMode = DragMode.NONE
+        private enum class Mode { NONE, MOVE, RESIZE }
+        private var mode = Mode.NONE
         private var lastX = 0f
         private var lastY = 0f
-        private val handleRadius = 36f
+        private val handleR = 36f
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val w = width.toFloat()
             val h = height.toFloat()
-
             canvas.drawRect(0f, 0f, w, boxRect.top.toFloat(), dimPaint)
             canvas.drawRect(0f, boxRect.bottom.toFloat(), w, h, dimPaint)
             canvas.drawRect(0f, boxRect.top.toFloat(), boxRect.left.toFloat(), boxRect.bottom.toFloat(), dimPaint)
             canvas.drawRect(boxRect.right.toFloat(), boxRect.top.toFloat(), w, boxRect.bottom.toFloat(), dimPaint)
-
             canvas.drawRect(boxRect, borderPaint)
-            canvas.drawCircle(boxRect.right.toFloat(), boxRect.bottom.toFloat(), handleRadius, handlePaint)
+            canvas.drawCircle(boxRect.right.toFloat(), boxRect.bottom.toFloat(), handleR, handlePaint)
         }
 
+        @SuppressLint("ClickableViewAccessibility")
         override fun onTouchEvent(event: MotionEvent): Boolean {
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     lastX = event.x
                     lastY = event.y
-                    val distBr = kotlin.math.hypot(
-                        (event.x - boxRect.right).toDouble(),
-                        (event.y - boxRect.bottom).toDouble()
-                    )
-                    dragMode = when {
-                        distBr <= handleRadius * 1.8 -> DragMode.RESIZE_BR
-                        boxRect.contains(event.x.toInt(), event.y.toInt()) -> DragMode.MOVE
-                        else -> DragMode.NONE
+                    val d = kotlin.math.hypot((event.x - boxRect.right).toDouble(), (event.y - boxRect.bottom).toDouble())
+                    mode = when {
+                        d <= handleR * 1.8 -> Mode.RESIZE
+                        boxRect.contains(event.x.toInt(), event.y.toInt()) -> Mode.MOVE
+                        else -> Mode.NONE
                     }
-                    return dragMode != DragMode.NONE
+                    return mode != Mode.NONE
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.x - lastX).toInt()
                     val dy = (event.y - lastY).toInt()
                     lastX = event.x
                     lastY = event.y
-
-                    when (dragMode) {
-                        DragMode.MOVE -> {
-                            val newLeft = (boxRect.left + dx).coerceIn(0, width - boxRect.width())
-                            val newTop = (boxRect.top + dy).coerceIn(0, height - boxRect.height())
-                            boxRect.offsetTo(newLeft, newTop)
+                    when (mode) {
+                        Mode.MOVE -> {
+                            boxRect.offsetTo(
+                                (boxRect.left + dx).coerceIn(0, (width - boxRect.width()).coerceAtLeast(0)),
+                                (boxRect.top + dy).coerceIn(0, (height - boxRect.height()).coerceAtLeast(0))
+                            )
                         }
-                        DragMode.RESIZE_BR -> {
-                            val newRight = (boxRect.right + dx).coerceIn(boxRect.left + 120, width)
-                            val newBottom = (boxRect.bottom + dy).coerceIn(boxRect.top + 120, height)
-                            boxRect.right = newRight
-                            boxRect.bottom = newBottom
+                        Mode.RESIZE -> {
+                            boxRect.right = (boxRect.right + dx).coerceIn(boxRect.left + 120, width)
+                            boxRect.bottom = (boxRect.bottom + dy).coerceIn(boxRect.top + 120, height)
                         }
-                        DragMode.NONE -> Unit
+                        Mode.NONE -> Unit
                     }
                     onRectChanged(boxRect)
                     invalidate()
                     return true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    dragMode = DragMode.NONE
+                    mode = Mode.NONE
                     return true
                 }
             }
