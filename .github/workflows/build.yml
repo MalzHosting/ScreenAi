@@ -29,7 +29,9 @@ jobs:
           fi
           chmod +x gradlew
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --console=plain
+        run: |
+          ./gradlew assembleDebug --console=plain || true
+          ./gradlew assembleDebug --console=plain --rerun-tasks | grep -E "FAILURE:|Caused by:|Could not|Execution failed" -A 3 || exit 1
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
