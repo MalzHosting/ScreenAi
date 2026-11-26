@@ -16,10 +16,12 @@ jobs:
         with:
           java-version: "17"
           distribution: "temurin"
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Accept Android Licenses
-        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+      - name: Install Android SDK 35 & Build Tools
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
       - name: Generate Gradle Wrapper if missing
         run: |
           if [ ! -f "./gradlew" ]; then
