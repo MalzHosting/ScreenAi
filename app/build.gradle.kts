@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "com.example.floatingai"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.floatingai"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
     }
