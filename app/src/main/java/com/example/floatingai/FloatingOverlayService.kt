@@ -10,10 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.DashPathEffect
-import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -42,6 +39,7 @@ import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -72,6 +70,7 @@ class FloatingOverlayService : Service() {
 
     private var windowManager: WindowManager? = null
     private var panelContainer: LinearLayout? = null
+    private var panelParams: WindowManager.LayoutParams? = null
     private var panelWebView: WebView? = null
     private var bubbleView: TextView? = null
     private var cropOverlayContainer: FrameLayout? = null
@@ -85,6 +84,10 @@ class FloatingOverlayService : Service() {
     private var screenHeight = 1920
     private var screenDensity = 3
     private var selectedRect = Rect(80, 320, 1000, 1100)
+
+    private var panelWidthPx = 640
+    private var panelHeightPx = 520
+    private var sizePresetIndex = 0 // 0 = Compact, 1 = Medium, 2 = Large
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -143,6 +146,39 @@ class FloatingOverlayService : Service() {
             prefs.getInt("crop_right", defR).coerceIn(120, screenWidth),
             prefs.getInt("crop_bottom", defB).coerceIn(120, screenHeight)
         )
+
+        applySizePreset(sizePresetIndex, updateWindow = false)
+    }
+
+    private fun applySizePreset(index: Int, updateWindow: Boolean = true) {
+        sizePresetIndex = ((index % 3) + 3) % 3
+        when (sizePresetIndex) {
+            0 -> { // Compact (kecil agar soal di layar tetap kelihatan)
+                panelWidthPx = (screenWidth * 0.62f).toInt().coerceAtLeast(360)
+                panelHeightPx = (screenHeight * 0.27f).toInt().coerceAtLeast(260)
+            }
+            1 -> { // Medium
+                panelWidthPx = (screenWidth * 0.78f).toInt().coerceAtLeast(420)
+                panelHeightPx = (screenHeight * 0.37f).toInt().coerceAtLeast(340)
+            }
+            else -> { // Large
+                panelWidthPx = (screenWidth * 0.90f).toInt().coerceAtLeast(460)
+                panelHeightPx = (screenHeight * 0.48f).toInt().coerceAtLeast(420)
+            }
+        }
+
+        if (updateWindow) {
+            val p = panelParams
+            val v = panelContainer
+            if (p != null && v != null) {
+                p.width = panelWidthPx
+                p.height = panelHeightPx
+                try {
+                    windowManager?.updateViewLayout(v, p)
+                } catch (_: Exception) {
+                }
+            }
+        }
     }
 
     private fun saveSelectedRect(rect: Rect) {
@@ -248,29 +284,68 @@ class FloatingOverlayService : Service() {
         removeBubbleView()
         removeCropOverlay()
 
-        if (panelContainer != null) {
+        if (panelContainer != null && panelParams != null) {
+            panelParams?.width = panelWidthPx
+            panelParams?.height = panelHeightPx
+            try {
+                windowManager?.updateViewLayout(panelContainer, panelParams)
+            } catch (_: Exception) {
+            }
             panelContainer?.visibility = View.VISIBLE
             return
         }
 
         val params = WindowManager.LayoutParams(
-            (screenWidth * 0.88f).toInt(),
-            (screenHeight * 0.46f).toInt(),
+            panelWidthPx,
+            panelHeightPx,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 32
-            y = 140
+            x = 24
+            y = 120
         }
+        panelParams = params
 
         val dragBar = TextView(this).apply {
-            text = "  ≡  ScreenAi  •  Geser Panel"
+            text = "  ≡ ScreenAi  •  Geser"
             setTextColor(Color.parseColor("#38BDF8"))
-            textSize = 12f
+            textSize = 11f
             setBackgroundColor(Color.parseColor("#FF0F172A"))
-            setPadding(16, 18, 16, 18)
+            setPadding(12, 12, 8, 12)
+        }
+
+        val shrinkBtn = TextView(this).apply {
+            text = "−"
+            setTextColor(Color.parseColor("#E2E8F0"))
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#FF1E293B"))
+            setPadding(22, 8, 22, 8)
+            setOnClickListener {
+                applySizePreset(sizePresetIndex - 1, updateWindow = true)
+            }
+        }
+
+        val growBtn = TextView(this).apply {
+            text = "+"
+            setTextColor(Color.parseColor("#38BDF8"))
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#FF1E293B"))
+            setPadding(22, 8, 22, 8)
+            setOnClickListener {
+                applySizePreset(sizePresetIndex + 1, updateWindow = true)
+            }
+        }
+
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#FF0F172A"))
+            addView(dragBar, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(shrinkBtn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(growBtn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
         var initialX = 0
@@ -308,11 +383,54 @@ class FloatingOverlayService : Service() {
         }
         panelWebView = wv
 
+        val resizeHandle = TextView(this).apply {
+            text = "⤡ Tarik Ukuran"
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 10f
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#FF0F172A"))
+            setPadding(12, 8, 16, 8)
+        }
+
+        var startW = panelWidthPx
+        var startH = panelHeightPx
+        var resTouchX = 0f
+        var resTouchY = 0f
+
+        resizeHandle.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startW = params.width
+                    startH = params.height
+                    resTouchX = event.rawX
+                    resTouchY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val newW = (startW + (event.rawX - resTouchX).toInt())
+                        .coerceIn((screenWidth * 0.42f).toInt(), (screenWidth * 0.95f).toInt())
+                    val newH = (startH + (event.rawY - resTouchY).toInt())
+                        .coerceIn((screenHeight * 0.20f).toInt(), (screenHeight * 0.75f).toInt())
+                    panelWidthPx = newW
+                    panelHeightPx = newH
+                    params.width = newW
+                    params.height = newH
+                    try {
+                        windowManager?.updateViewLayout(panelContainer, params)
+                    } catch (_: Exception) {
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#F20A101D"))
-            addView(dragBar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            addView(wv, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT))
+            addView(topBar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(wv, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(resizeHandle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
         try {
@@ -332,22 +450,22 @@ class FloatingOverlayService : Service() {
             <style>
               * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
               body {
-                margin: 0; padding: 10px; background: transparent; color: #F8FAFC;
+                margin: 0; padding: 8px; background: transparent; color: #F8FAFC;
                 display: flex; flex-direction: column; height: 100vh;
               }
-              .grid-btn { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-bottom: 8px; }
+              .grid-btn { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 7px; }
               button {
-                border: none; border-radius: 10px; padding: 9px 8px;
-                font-size: 11px; font-weight: 700; cursor: pointer;
+                border: none; border-radius: 9px; padding: 7px 6px;
+                font-size: 10.5px; font-weight: 700; cursor: pointer;
               }
               .b-area { background: rgba(56,189,248,0.18); color: #38BDF8; border: 1px solid rgba(56,189,248,0.35); }
               .b-scan { background: linear-gradient(135deg, #0284C7, #38BDF8); color: #04101A; }
               .b-min  { background: rgba(148,163,184,0.16); color: #E2E8F0; border: 1px solid rgba(148,163,184,0.25); }
               .b-rev  { background: rgba(239,68,68,0.2); color: #F87171; border: 1px solid rgba(248,113,113,0.4); }
               .answer-box {
-                flex: 1; overflow-y: auto; background: rgba(2, 6, 23, 0.85);
-                border: 1px solid rgba(148,163,184,0.16); border-radius: 12px;
-                padding: 10px; font-size: 12px; line-height: 1.5; color: #E2E8F0;
+                flex: 1; overflow-y: auto; background: rgba(2, 6, 23, 0.88);
+                border: 1px solid rgba(148,163,184,0.16); border-radius: 10px;
+                padding: 8px; font-size: 11px; line-height: 1.45; color: #E2E8F0;
                 white-space: pre-wrap;
               }
             </style>
@@ -359,7 +477,7 @@ class FloatingOverlayService : Service() {
                 <button class="b-min" onclick="OverlayApi.minimizeBubble()">Tutup ke Icon</button>
                 <button class="b-rev" onclick="OverlayApi.revokeNow()">Revoke Semua</button>
               </div>
-              <div id="out" class="answer-box">Atur area soal/gambar lalu tekan Scan Soal.</div>
+              <div id="out" class="answer-box">Atur area lalu tekan Scan Soal. Gunakan tombol - / + atau Tarik Ukuran untuk mengecilkan panel.</div>
               <script>
                 function setAnswer(text) {
                   const box = document.getElementById('out');
@@ -396,16 +514,16 @@ class FloatingOverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 28
-            y = 280
+            x = 24
+            y = 260
         }
 
         val bubble = TextView(this).apply {
             text = "AI"
             setTextColor(Color.WHITE)
-            textSize = 15f
+            textSize = 14f
             setBackgroundColor(Color.parseColor("#E60284C7"))
-            setPadding(32, 24, 32, 24)
+            setPadding(28, 20, 28, 20)
         }
 
         var initialX = 0
@@ -552,7 +670,7 @@ class FloatingOverlayService : Service() {
                     }
 
                     val reply = withContext(Dispatchers.IO) {
-                        askGemini(apiKey, cropped)
+                        askGeminiWithRetry(apiKey, cropped)
                     }
                     cropped.recycle()
                     pushAnswerToPanel(reply)
@@ -564,9 +682,9 @@ class FloatingOverlayService : Service() {
         }, 250)
     }
 
-    private fun askGemini(apiKey: String, bitmap: Bitmap): String {
+    private suspend fun askGeminiWithRetry(apiKey: String, bitmap: Bitmap): String {
         val baos = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 82, baos)
         val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
         val parts = JSONArray().apply {
@@ -577,7 +695,7 @@ class FloatingOverlayService : Service() {
                 })
             })
             put(JSONObject().apply {
-                put("text", "Baca teks, rumus, tabel, atau gambar soal pada bagian layar ini. Berikan jawaban yang jelas, tepat, dan ringkas dalam Bahasa Indonesia.")
+                put("text", "Baca teks, rumus, tabel, atau gambar soal pada bagian layar ini. Berikan jawaban akhir yang jelas dan langkah singkat dalam Bahasa Indonesia.")
             })
         }
         val payload = JSONObject().apply {
@@ -586,34 +704,58 @@ class FloatingOverlayService : Service() {
             })
         }
 
-        val models = listOf("gemini-3.8-flash", "gemini-2.5-flash")
+        val models = listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash")
         var lastError = ""
 
         for (modelName in models) {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
-            val req = Request.Builder()
-                .url(url)
-                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
+            for (attempt in 1..2) {
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+                val req = Request.Builder()
+                    .url(url)
+                    .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
 
-            httpClient.newCall(req).execute().use { res ->
-                val bodyStr = res.body?.string().orEmpty()
-                if (res.isSuccessful) {
-                    val json = JSONObject(bodyStr)
-                    val cand = json.optJSONArray("candidates") ?: return "Respons kosong."
-                    if (cand.length() == 0) return "Tidak ada jawaban dihasilkan."
-                    val resParts = cand.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
-                        ?: return "Format tidak valid."
-                    val sb = StringBuilder()
-                    for (i in 0 until resParts.length()) {
-                        val t = resParts.getJSONObject(i).optString("text", "")
-                        if (t.isNotEmpty()) sb.append(t)
+                try {
+                    httpClient.newCall(req).execute().use { res ->
+                        val bodyStr = res.body?.string().orEmpty()
+                        if (res.isSuccessful) {
+                            val json = JSONObject(bodyStr)
+                            val cand = json.optJSONArray("candidates") ?: return "Respons kosong."
+                            if (cand.length() == 0) return "Tidak ada jawaban dihasilkan."
+                            val resParts = cand.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
+                                ?: return "Format tidak valid."
+                            val sb = StringBuilder()
+                            for (i in 0 until resParts.length()) {
+                                val t = resParts.getJSONObject(i).optString("text", "")
+                                if (t.isNotEmpty()) sb.append(t)
+                            }
+                            return if (sb.isNotEmpty()) sb.toString().trim() else "Jawaban kosong."
+                        } else {
+                            val errMsg = try {
+                                JSONObject(bodyStr).optJSONObject("error")?.optString("message") ?: bodyStr
+                            } catch (_: Exception) {
+                                bodyStr
+                            }
+                            lastError = "[$modelName] HTTP ${res.code}: $errMsg"
+                            if (res.code == 503 || res.code == 429) {
+                                if (attempt == 1) {
+                                    delay(900)
+                                    continue
+                                }
+                                break // pindah ke model berikutnya
+                            }
+                            if (res.code != 404) {
+                                return lastError
+                            }
+                            break
+                        }
                     }
-                    return if (sb.isNotEmpty()) sb.toString().trim() else "Jawaban kosong."
-                } else {
-                    lastError = "[$modelName] HTTP ${res.code}: $bodyStr"
-                    if (res.code != 404) {
-                        return lastError
+                } catch (e: Exception) {
+                    lastError = "[$modelName] ${e.message}"
+                    if (attempt == 1) {
+                        delay(800)
+                    } else {
+                        break
                     }
                 }
             }
