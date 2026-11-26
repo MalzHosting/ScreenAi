@@ -5,16 +5,21 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 
 class FloatingOverlayService : Service() {
     private var windowManager: WindowManager? = null
@@ -33,17 +38,25 @@ class FloatingOverlayService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 channelId,
-                "Floating AI Service",
-                NotificationManager.IMPORTANCE_LOW
+                "ScreenAi Overlay Service",
+                NotificationManager.IMPORTANCE_DEFAULT
             )
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
+
         val notif: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("FloatingSoalAI Aktif")
-            .setContentText("Siap membaca soal di layar")
+            .setContentTitle("ScreenAi Aktif")
+            .setContentText("Floating mod menu berjalan di layar")
             .setSmallIcon(android.R.drawable.ic_menu_search)
+            .setOngoing(true)
             .build()
-        startForeground(1, notif)
+
+        val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        } else {
+            0
+        }
+        ServiceCompat.startForeground(this, 1, notif, fgsType)
     }
 
     private fun showFloatingMenu() {
@@ -56,14 +69,20 @@ class FloatingOverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 40
-            y = 200
+            x = 50
+            y = 260
+        }
+
+        val headerView = TextView(this).apply {
+            text = "≡ ScreenAi Menu"
+            setTextColor(Color.CYAN)
+            setPadding(16, 10, 16, 10)
         }
 
         val resultView = TextView(this).apply {
-            text = "Hasil jawaban muncul di sini"
+            text = "Overlay siap. Tekan Scan Soal."
             setTextColor(Color.WHITE)
-            setPadding(16, 12, 16, 12)
+            setPadding(16, 10, 16, 10)
         }
 
         val scanBtn = Button(this).apply {
@@ -80,20 +99,62 @@ class FloatingOverlayService : Service() {
             }
         }
 
-        overlayView = LinearLayout(this).apply {
+        val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#CC121212"))
-            setPadding(20, 20, 20, 20)
+            setBackgroundColor(Color.parseColor("#E610141D"))
+            setPadding(24, 24, 24, 24)
+            addView(headerView)
             addView(scanBtn)
             addView(resultView)
             addView(closeBtn)
         }
 
-        windowManager?.addView(overlayView, params)
+        var initialX = 0
+        var initialY = 0
+        var touchX = 0f
+        var touchY = 0f
+
+        headerView.setOnTouchListener(object : View.OnTouchListener {
+            override fun onTouch(v: View?, event: MotionEvent): Boolean {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        initialX = params.x
+                        initialY = params.y
+                        touchX = event.rawX
+                        touchY = event.rawY
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        params.x = initialX + (event.rawX - touchX).toInt()
+                        params.y = initialY + (event.rawY - touchY).toInt()
+                        try {
+                            windowManager?.updateViewLayout(container, params)
+                        } catch (_: Exception) {
+                        }
+                        return true
+                    }
+                }
+                return false
+            }
+        })
+
+        try {
+            windowManager?.addView(container, params)
+            overlayView = container
+        } catch (e: Exception) {
+            Toast.makeText(this, "Gagal tampilkan overlay: ${e.message}", Toast.LENGTH_LONG).show()
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {
-        overlayView?.let { windowManager?.removeView(it) }
+        overlayView?.let {
+            try {
+                windowManager?.removeView(it)
+            } catch (_: Exception) {
+            }
+        }
+        overlayView = null
         super.onDestroy()
     }
 }
