@@ -16,14 +16,18 @@ jobs:
         with:
           java-version: "17"
           distribution: "temurin"
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Accept Android Licenses
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
       - name: Generate Gradle Wrapper if missing
         run: |
           if [ ! -f "./gradlew" ]; then
-            gradle wrapper --gradle-version 8.7
+            gradle wrapper --gradle-version 8.9
           fi
           chmod +x gradlew
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: ./gradlew assembleDebug --console=plain
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
